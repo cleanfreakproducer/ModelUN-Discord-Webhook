@@ -39,9 +39,9 @@ async def scrape_with_gemini(url: str) -> dict:
         - "committees": string (list up to 8 committees separated by bullet points e.g. "• UNSC\n• DISEC\n• SOCHUM")
         """
 
-        # Using Flash-Lite with Google Search grounding enabled
+        # Using gemini-3.5-flash-lite with Google Search grounding enabled
         response = await client.aio.models.generate_content(
-            model='gemini-2.5-flash-lite',
+            model='gemini-3.5-flash-lite',
             contents=prompt,
             config=types.GenerateContentConfig(
                 tools=[types.Tool(google_search=types.GoogleSearch())]
@@ -81,7 +81,6 @@ async def on_ready():
 @bot.tree.command(name="mun", description="Scrape and package info for a Model UN conference")
 @app_commands.describe(url="The URL of the MUN conference website")
 async def mun_command(interaction: discord.Interaction, url: str):
-    # Defer response immediately to prevent Discord's 3-second timeout
     await interaction.response.defer(thinking=True)
     
     data = await scrape_with_gemini(url)
