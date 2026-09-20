@@ -1,82 +1,105 @@
 import os
 import re
-import requests
-from bs4 import BeautifulSoup
+import asyncio
 import discord
 from discord import app_commands
 from discord.ext import commands
+from bs4 import BeautifulSoup
+from playwright.async_api import async_playwright
 
 # ---------------------------------------------------------
 # CONFIGURATION
 # ---------------------------------------------------------
-# paste your discord bot token here (or keep it in secrets)
 BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
 
-# bot setup
 intents = discord.Intents.default()
+intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ---------------------------------------------------------
-# SCRAPER LOGIC
+# ADVANCED JS-ENABLED SCRAPER
 # ---------------------------------------------------------
-def scrape_mun_website(url: str) -> dict:
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-    }
-    
-    try:
-        response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
-    except Exception as e:
-        return {"error": f"failed to fetch site ({url}): {str(e)}"}
+async def fetch_rendered_html(url: str) -> str:
+    """Renders the website using a headless browser to execute JavaScript."""
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
+        )
+        page = await context.new_page()
+        try:
+            await page.goto(url, timeout=25000, wait_until="domcontentloaded")
+            await page.wait_for_timeout(3000)  # Wait 3s for JS components/tables to render
+            content = await page.content()
+        except Exception:
+            content = ""
+        finally:
+            await browser.close()
+        return content
 
-    soup = BeautifulSoup(response.text, 'html.parser')
-    page_text = soup.get_text()
+def scrape_mun_website_smart(url: str, html_content: str) -> dict:
+    if not html_content:
+        return {"error": f"Failed to render website or request timed out ({url})"}
 
-    title = soup.title.string.strip() if soup.title else "model un conference"
-    
-    # dates / timing
-    dates = "check website for dates"
+    soup = BeautifulSoup(html_content, 'html.parser')
+    page_text = soup.get_text(separator=' ')
+
+    # 1. Conference Title
+    title = soup.title.string.strip() if soup.title else "Model UN Conference"
+    title = re.sub(r'\s+', ' ', title)
+
+    # 2. Smart Date Matching (Supports multi-day ranges across months)
+    dates = "Check website for dates"
     date_patterns = [
-        r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{1,2}(?:-\d{1,2})?,? \d{4}',
-        r'\d{1,2}(?:-\d{1,2})? (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{4}'
+        r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{1,2}\s*(?:–|-|to)\s*(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)?[a-z]* \d{1,2},? \d{4}',
+        r'\d{1,2}\s*(?:–|-|to)\s*\d{1,2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{4}',
+        r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{1,2},? \d{4}'
     ]
     for pattern in date_patterns:
         match = re.search(pattern, page_text, re.IGNORECASE)
         if match:
-            dates = match.group(0)
+            dates = match.group(0).strip()
             break
 
-    # pricing
-    prices = re.findall(r'(\$\d+|\d+\s?USD|\d+\s?EUR|\d+\s?GBP)', page_text)
-    pricing = ", ".join(list(set(prices))[:4]) if prices else "refer to website for fees."
+    # 3. Smart Pricing Search (Looks near registration/fee keywords)
+    pricing_list = []
+    fee_contexts = soup.find_all(string=re.compile(r'fee|price|cost|delegate|registration|\$', re.I))
+    for ctx in fee_contexts:
+        parent_text = ctx.parent.get_text() if ctx.parent else ""
+        prices = re.findall(r'(\$\d+(?:\.\d{2})?|\d+\s?CAD|\d+\s?USD|\d+\s?EUR|\d+\s?GBP)', parent_text)
+        for p in prices:
+            if p not in pricing_list:
+                pricing_list.append(p)
+    
+    pricing_str = ", ".join(pricing_list[:5]) if pricing_list else "Check website for fee schedule."
 
-    # committees
+    # 4. Committee Extraction (Scrapes tables, lists, and common MUN committees)
     committees = []
-    keywords = ["DISEC", "SOCHUM", "SPECPOL", "UNSC", "ECOSOC", "ICJ", "HCC", "Crisis", "UNHRC"]
-    for kw in keywords:
-        if kw in page_text:
-            committees.append(kw)
-
-    for header in soup.find_all(['h2', 'h3', 'h4', 'a']):
-        text = header.get_text().strip()
-        if ("committee" in text.lower() or "council" in text.lower()) and len(text) < 50:
-            if text not in committees:
+    
+    # Check tables & structured blocks
+    for element in soup.find_all(['td', 'h3', 'h4', 'a', 'li']):
+        text = element.get_text().strip()
+        # Look for committee names or acronyms
+        if any(kw in text.upper() for kw in ["UNSC", "DISEC", "SOCHUM", "SPECPOL", "ECOSOC", "ICJ", "CRISIS", "PRESS", "WHO", "UNHRC", "HISTORICAL"]):
+            if len(text) < 60 and text not in committees:
+                committees.append(text)
+        elif "committee" in text.lower() or "council" in text.lower():
+            if 5 < len(text) < 50 and text not in committees:
                 committees.append(text)
 
-    committees_formatted = "\n• " + "\n• ".join(committees[:8]) if committees else "see website for full list."
+    committees_formatted = "\n• " + "\n• ".join(committees[:10]) if committees else "See website for committee matrix."
 
     return {
         "title": title,
         "url": url,
         "dates": dates,
-        "pricing": pricing,
+        "pricing": pricing_str,
         "committees": committees_formatted,
         "icon_url": "https://upload.wikimedia.org/wikipedia/commons/thumb/2/22/Flag_of_the_United_Nations.svg/1200px-Flag_of_the_United_Nations.svg.png"
     }
 
 # ---------------------------------------------------------
-# BOT EVENTS & COMMANDS
+# BOT COMMANDS
 # ---------------------------------------------------------
 @bot.event
 async def on_ready():
@@ -90,10 +113,14 @@ async def on_ready():
 @bot.tree.command(name="mun", description="scrape and package info for a model un conference website")
 @app_commands.describe(url="the url of the mun conference website")
 async def mun_command(interaction: discord.Interaction, url: str):
-    # defer response so discord doesn't time out while scraping
     await interaction.response.defer(thinking=True)
     
-    data = scrape_mun_website(url)
+    # Fetch dynamic HTML using Playwright in an async task
+    html_content = await fetch_rendered_html(url)
+    
+    # Run parsing in executor to avoid blocking the event loop
+    loop = asyncio.get_event_loop()
+    data = await loop.run_in_executor(None, scrape_mun_website_smart, url, html_content)
 
     if "error" in data:
         await interaction.followup.send(f"❌ {data['error']}")
@@ -116,8 +143,5 @@ async def mun_command(interaction: discord.Interaction, url: str):
 
     await interaction.followup.send(embed=embed)
 
-# ---------------------------------------------------------
-# START BOT
-# ---------------------------------------------------------
 if __name__ == "__main__":
     bot.run(BOT_TOKEN)
