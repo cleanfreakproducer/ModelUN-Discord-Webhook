@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import asyncio
 import requests
 from bs4 import BeautifulSoup
 import discord
@@ -19,24 +20,29 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ---------------------------------------------------------
-# AI-POWERED SCRAPER
+# AI-POWERED SCRAPER (NON-BLOCKING)
 # ---------------------------------------------------------
-def scrape_with_gemini(url: str) -> dict:
+async def scrape_with_gemini(url: str) -> dict:
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
     }
     
+    # 1. Fetch web page inside a background thread to prevent blocking
     try:
-        res = requests.get(url, headers=headers, timeout=12)
-        res.raise_for_status()
+        def fetch():
+            res = requests.get(url, headers=headers, timeout=10)
+            res.raise_for_status()
+            return res.text
+            
+        html_text = await asyncio.to_thread(fetch)
     except Exception as e:
-        return {"error": f"Failed to reach website: {str(e)}"}
+        return {"error": f"failed to reach website: {str(e)}"}
 
-    soup = BeautifulSoup(res.text, 'html.parser')
-    page_text = soup.get_text(separator=' ')[:15000] # Pass first 15k characters
+    soup = BeautifulSoup(html_text, 'html.parser')
+    page_text = soup.get_text(separator=' ')[:15000]
     title = soup.title.string.strip() if soup.title else "Model UN Conference"
 
-    # Call Gemini to extract structured info
+    # 2. Asynchronous Gemini Call
     if GEMINI_API_KEY:
         try:
             client = genai.Client(api_key=GEMINI_API_KEY)
@@ -50,7 +56,9 @@ def scrape_with_gemini(url: str) -> dict:
             Website Text:
             {page_text}
             """
-            response = client.models.generate_content(
+            
+            # Use non-blocking async client
+            response = await client.aio.models.generate_content(
                 model='gemini-2.5-flash',
                 contents=prompt,
             )
@@ -67,9 +75,8 @@ def scrape_with_gemini(url: str) -> dict:
                 "icon_url": "https://upload.wikimedia.org/wikipedia/commons/thumb/2/22/Flag_of_the_United_Nations.svg/1200px-Flag_of_the_United_Nations.svg.png"
             }
         except Exception as e:
-            print(f"Gemini extraction warning: {e}")
+            print(f"gemini extraction warning: {e}")
 
-    # Fallback if Gemini API key isn't provided or fails
     return {
         "title": title,
         "url": url,
@@ -90,9 +97,11 @@ async def on_ready():
 @bot.tree.command(name="mun", description="scrape and package info for a model un conference website")
 @app_commands.describe(url="the url of the mun conference website")
 async def mun_command(interaction: discord.Interaction, url: str):
+    # defer immediately so discord gives the bot up to 15 minutes to respond
     await interaction.response.defer(thinking=True)
     
-    data = scrape_with_gemini(url)
+    # scrape asynchronously
+    data = await scrape_with_gemini(url)
 
     if "error" in data:
         await interaction.followup.send(f"❌ {data['error']}")
