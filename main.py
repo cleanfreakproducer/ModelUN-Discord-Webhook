@@ -41,7 +41,7 @@ async def scrape_with_gemini(url: str) -> dict:
 
         # Using gemini-3.5-flash-lite with Google Search grounding enabled
         response = await client.aio.models.generate_content(
-            model='gemini-3.5-flash-lite',
+            model='gemini-3.5-flash',
             contents=prompt,
             config=types.GenerateContentConfig(
                 tools=[types.Tool(google_search=types.GoogleSearch())]
