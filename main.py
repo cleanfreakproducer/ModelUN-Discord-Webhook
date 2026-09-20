@@ -33,15 +33,15 @@ async def scrape_with_gemini(url: str) -> dict:
         Search the web and navigate its pages if needed to find exact, up-to-date conference details.
         
         Return ONLY a valid raw JSON object (no markdown formatting, no code blocks) with these exact keys:
-        - "title": string (e.g. "CAIMUN 2026")
+        - "title": string (e.g. "CAIMUN")
         - "dates": string (e.g. "May 22-24, 2026")
         - "pricing": string (e.g. "$75 Delegate Fee, $45 Delegation Fee")
         - "committees": string (list up to 8 committees separated by bullet points e.g. "• UNSC\n• DISEC\n• SOCHUM")
         """
 
-        # Enable Google Search Tool inside Gemini
+        # Using Flash-Lite with Google Search grounding enabled
         response = await client.aio.models.generate_content(
-            model='gemini-2.5-flash',
+            model='gemini-2.5-flash-lite',
             contents=prompt,
             config=types.GenerateContentConfig(
                 tools=[types.Tool(google_search=types.GoogleSearch())]
@@ -81,7 +81,7 @@ async def on_ready():
 @bot.tree.command(name="mun", description="Scrape and package info for a Model UN conference")
 @app_commands.describe(url="The URL of the MUN conference website")
 async def mun_command(interaction: discord.Interaction, url: str):
-    # Defer response immediately to avoid the 3-second Discord timeout
+    # Defer response immediately to prevent Discord's 3-second timeout
     await interaction.response.defer(thinking=True)
     
     data = await scrape_with_gemini(url)
