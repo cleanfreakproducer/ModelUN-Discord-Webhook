@@ -2,13 +2,11 @@ import os
 import re
 import json
 import asyncio
-import requests
-from bs4 import BeautifulSoup
 import discord
 from discord import app_commands
 from discord.ext import commands
 from google import genai
-from urllib.parse import urljoin, urlparse
+from google.genai import types
 
 # ---------------------------------------------------------
 # CONFIGURATION
@@ -21,119 +19,71 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ---------------------------------------------------------
-# AI-POWERED SCRAPER (NON-BLOCKING)
+# GEMINI LIVE WEB SEARCH SCRAPER
 # ---------------------------------------------------------
 async def scrape_with_gemini(url: str) -> dict:
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-    }
-    
-    # 1. Fetch main page and subpages concurrently
-    def fetch_site_content():
-        try:
-            res = requests.get(url, headers=headers, timeout=10)
-            res.raise_for_status()
-        except Exception as e:
-            return None, f"failed to reach website: {str(e)}"
+    if not GEMINI_API_KEY:
+        return {"error": "GEMINI_API_KEY environment variable is not configured."}
 
-        soup = BeautifulSoup(res.text, 'html.parser')
-        title = soup.title.string.strip() if soup.title else "Model UN Conference"
+    try:
+        client = genai.Client(api_key=GEMINI_API_KEY)
         
-        # Base page text
-        combined_text = [soup.get_text(separator=' ')]
+        prompt = f"""
+        Research and analyze the Model UN conference at this URL/organization: {url}
+        Search the web and navigate its pages if needed to find exact, up-to-date conference details.
         
-        # Discover relevant subpage links (e.g. /committees, /registration, /about)
-        target_keywords = ["committee", "register", "registration", "fee", "about", "schedule"]
-        base_domain = urlparse(url).netloc
-        subpage_urls = set()
+        Return ONLY a valid raw JSON object (no markdown formatting, no code blocks) with these exact keys:
+        - "title": string (e.g. "CAIMUN 2026")
+        - "dates": string (e.g. "May 22-24, 2026")
+        - "pricing": string (e.g. "$75 Delegate Fee, $45 Delegation Fee")
+        - "committees": string (list up to 8 committees separated by bullet points e.g. "• UNSC\n• DISEC\n• SOCHUM")
+        """
 
-        for a in soup.find_all('a', href=True):
-            href = a['href']
-            full_url = urljoin(url, href)
-            # Ensure it's inside the same domain and matches key MUN subpages
-            if urlparse(full_url).netloc == base_domain:
-                if any(kw in href.lower() for kw in target_keywords):
-                    subpage_urls.add(full_url)
-
-        # Scrape up to 4 relevant subpages
-        for sub_url in list(subpage_urls)[:4]:
-            try:
-                sub_res = requests.get(sub_url, headers=headers, timeout=5)
-                if sub_res.status_code == 200:
-                    sub_soup = BeautifulSoup(sub_res.text, 'html.parser')
-                    combined_text.append(sub_soup.get_text(separator=' '))
-            except Exception:
-                continue
-
-        # Combine text and truncate to fit context window safely
-        full_site_text = " ".join(combined_text)[:30000]
-        return (title, full_site_text), None
-
-    site_data, error = await asyncio.to_thread(fetch_site_content)
-    
-    if error:
-        return {"error": error}
-        
-    title, page_text = site_data
-
-    # 2. Asynchronous Gemini Call with combined text
-    if GEMINI_API_KEY:
-        try:
-            client = genai.Client(api_key=GEMINI_API_KEY)
-            prompt = f"""
-            Extract Model UN conference details from the combined website text below.
-            Return ONLY a valid JSON object with these keys:
-            - "dates": string (e.g. "March 5-7, 2027")
-            - "pricing": string (e.g. "$65 Delegate Fee, $40 Delegation Fee")
-            - "committees": string (list up to 8 committees separated by bullet points e.g. "• UNSC\n• DISEC")
-
-            Website Text:
-            {page_text}
-            """
-            
-            response = await client.aio.models.generate_content(
-                model='gemini-2.5-flash',
-                contents=prompt,
+        # Enable Google Search Tool inside Gemini
+        response = await client.aio.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                tools=[types.Tool(google_search=types.GoogleSearch())]
             )
-            
-            clean_json = re.sub(r'```json|```', '', response.text).strip()
-            extracted = json.loads(clean_json)
+        )
 
-            return {
-                "title": title,
-                "url": url,
-                "dates": extracted.get("dates", "See website"),
-                "pricing": extracted.get("pricing", "See website"),
-                "committees": extracted.get("committees", "See website"),
-                "icon_url": "https://upload.wikimedia.org/wikipedia/commons/thumb/2/22/Flag_of_the_United_Nations.svg/1200px-Flag_of_the_United_Nations.svg.png"
-            }
-        except Exception as e:
-            print(f"gemini extraction warning: {e}")
+        raw_text = response.text.strip()
+        # Clean any markdown code fences if generated
+        clean_json = re.sub(r'```json|```', '', raw_text).strip()
+        extracted = json.loads(clean_json)
 
-    return {
-        "title": title,
-        "url": url,
-        "dates": "Check website for dates",
-        "pricing": "Refer to website for fees",
-        "committees": "See website for full list",
-        "icon_url": "https://upload.wikimedia.org/wikipedia/commons/thumb/2/22/Flag_of_the_United_Nations.svg/1200px-Flag_of_the_United_Nations.svg.png"
-    }
+        return {
+            "title": extracted.get("title", "Model UN Conference"),
+            "url": url,
+            "dates": extracted.get("dates", "See website for dates"),
+            "pricing": extracted.get("pricing", "See website for fees"),
+            "committees": extracted.get("committees", "See website for committee list"),
+            "icon_url": "https://upload.wikimedia.org/wikipedia/commons/thumb/2/22/Flag_of_the_United_Nations.svg/1200px-Flag_of_the_United_Nations.svg.png"
+        }
+
+    except Exception as e:
+        print(f"Gemini live search error: {e}")
+        return {"error": f"Failed to retrieve conference details: {str(e)}"}
 
 # ---------------------------------------------------------
 # DISCORD BOT COMMANDS
 # ---------------------------------------------------------
 @bot.event
 async def on_ready():
-    print(f"logged in as {bot.user}")
-    await bot.tree.sync()
+    print(f"Logged in as {bot.user}")
+    try:
+        synced = await bot.tree.sync()
+        print(f"Synced {len(synced)} slash command(s)")
+    except Exception as e:
+        print(f"Failed to sync commands: {e}")
 
-@bot.tree.command(name="mun", description="scrape and package info for a model un conference website")
-@app_commands.describe(url="the url of the mun conference website")
+@bot.tree.command(name="mun", description="Scrape and package info for a Model UN conference")
+@app_commands.describe(url="The URL of the MUN conference website")
 async def mun_command(interaction: discord.Interaction, url: str):
-    # defer immediately so discord gives the bot up to 15 minutes to respond
+    # Defer response immediately to avoid the 3-second Discord timeout
     await interaction.response.defer(thinking=True)
     
-    # scrape asynchronously
     data = await scrape_with_gemini(url)
 
     if "error" in data:
@@ -143,7 +93,7 @@ async def mun_command(interaction: discord.Interaction, url: str):
     embed = discord.Embed(
         title=f"🇺🇳 {data['title']}",
         url=data['url'],
-        description="here are the conference details retrieved from the official website:",
+        description="Here are the conference details retrieved from the official website:",
         color=0x3498DB
     )
     embed.set_thumbnail(url=data['icon_url'])
