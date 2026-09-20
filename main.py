@@ -8,6 +8,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from google import genai
+from urllib.parse import urljoin, urlparse
 
 # ---------------------------------------------------------
 # CONFIGURATION
@@ -27,29 +28,62 @@ async def scrape_with_gemini(url: str) -> dict:
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
     }
     
-    # 1. Fetch web page inside a background thread to prevent blocking
-    try:
-        def fetch():
+    # 1. Fetch main page and subpages concurrently
+    def fetch_site_content():
+        try:
             res = requests.get(url, headers=headers, timeout=10)
             res.raise_for_status()
-            return res.text
-            
-        html_text = await asyncio.to_thread(fetch)
-    except Exception as e:
-        return {"error": f"failed to reach website: {str(e)}"}
+        except Exception as e:
+            return None, f"failed to reach website: {str(e)}"
 
-    soup = BeautifulSoup(html_text, 'html.parser')
-    page_text = soup.get_text(separator=' ')[:15000]
-    title = soup.title.string.strip() if soup.title else "Model UN Conference"
+        soup = BeautifulSoup(res.text, 'html.parser')
+        title = soup.title.string.strip() if soup.title else "Model UN Conference"
+        
+        # Base page text
+        combined_text = [soup.get_text(separator=' ')]
+        
+        # Discover relevant subpage links (e.g. /committees, /registration, /about)
+        target_keywords = ["committee", "register", "registration", "fee", "about", "schedule"]
+        base_domain = urlparse(url).netloc
+        subpage_urls = set()
 
-    # 2. Asynchronous Gemini Call
+        for a in soup.find_all('a', href=True):
+            href = a['href']
+            full_url = urljoin(url, href)
+            # Ensure it's inside the same domain and matches key MUN subpages
+            if urlparse(full_url).netloc == base_domain:
+                if any(kw in href.lower() for kw in target_keywords):
+                    subpage_urls.add(full_url)
+
+        # Scrape up to 4 relevant subpages
+        for sub_url in list(subpage_urls)[:4]:
+            try:
+                sub_res = requests.get(sub_url, headers=headers, timeout=5)
+                if sub_res.status_code == 200:
+                    sub_soup = BeautifulSoup(sub_res.text, 'html.parser')
+                    combined_text.append(sub_soup.get_text(separator=' '))
+            except Exception:
+                continue
+
+        # Combine text and truncate to fit context window safely
+        full_site_text = " ".join(combined_text)[:30000]
+        return (title, full_site_text), None
+
+    site_data, error = await asyncio.to_thread(fetch_site_content)
+    
+    if error:
+        return {"error": error}
+        
+    title, page_text = site_data
+
+    # 2. Asynchronous Gemini Call with combined text
     if GEMINI_API_KEY:
         try:
             client = genai.Client(api_key=GEMINI_API_KEY)
             prompt = f"""
-            Extract Model UN conference details from the text below. 
+            Extract Model UN conference details from the combined website text below.
             Return ONLY a valid JSON object with these keys:
-            - "dates": string (e.g. "May 15-17, 2026")
+            - "dates": string (e.g. "March 5-7, 2027")
             - "pricing": string (e.g. "$65 Delegate Fee, $40 Delegation Fee")
             - "committees": string (list up to 8 committees separated by bullet points e.g. "• UNSC\n• DISEC")
 
@@ -57,7 +91,6 @@ async def scrape_with_gemini(url: str) -> dict:
             {page_text}
             """
             
-            # Use non-blocking async client
             response = await client.aio.models.generate_content(
                 model='gemini-2.5-flash',
                 contents=prompt,
